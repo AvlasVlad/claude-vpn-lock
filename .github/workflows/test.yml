@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax (bash 3.2, the one macOS ships)
+        run: for f in *.sh lib/*.sh tests/*.sh; do /bin/bash -n "$f"; done
+      - name: Scripts are plain ASCII
+        run: "! LC_ALL=C grep -n '[^ -~\t]' *.sh lib/*.sh tests/*.sh"
+      - name: LaunchDaemon plist
+        run: plutil -lint lib/claude-vpn-lock.plist
+      - name: Daemon logic on fake pfctl/route/ifconfig/curl (no root, no network)
+        run: /bin/bash tests/sim.sh
+      - name: Dry runs and help work without root
+        run: |
+          /bin/bash install.sh --help
+          /bin/bash install.sh --dry-run
+          /bin/bash uninstall.sh --dry-run
