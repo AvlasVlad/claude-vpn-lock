@@ -188,20 +188,27 @@ tail -f /var/log/claude-vpn-lock.log
 
 ## How it was tested
 
-On a real Mac (macOS 26, Happ VPN), four full acceptance runs (`tests/acceptance.sh`):
-install, full check, the VPN switched off and on by hand, uninstall with comparison against
-the pre-install snapshot, reinstall. From the last run with the VPN switched off:
+On a real Mac (macOS 26, Apple silicon, Happ VPN), the full acceptance `tests/acceptance.sh
+--with-vpn-off` of this version passed every step: dry runs change nothing, install, full
+check, the VPN switched off and on by hand, uninstall, reinstall. From that run (4 Oct 2026):
 
-- 18 s without the VPN: **0** connections from Claude to Anthropic from the real IP address;
-  the kernel dropped 55 packets; the test packet was dropped 16 of 16 times; Claude was
-  open again 1 s after the VPN came back;
-- a packet to `160.79.104.10` from the Wi-Fi interface: refused at once, rule counter +1;
-- through the tunnel: Anthropic answers, rule counter unchanged;
-- the VPN app's own direct traffic is cut by the same kind of rule;
-- uninstall: the machine matches the pre-install snapshot line by line.
+- VPN off for 11 s: **0** connections from Claude to Anthropic from the real IP address; the
+  kernel dropped 51 packets to Anthropic; the test packet was refused 10 of 10 times. For the
+  first 2 s the daemon had not even noticed (it still said "open"), and the packets were
+  already refused: the rule does the blocking, not the daemon. Claude was open again 1 s
+  after the VPN came back.
+- A packet to `160.79.104.10` from the Wi-Fi interface: refused at once, rule counter +1.
+  Through the tunnel: Anthropic answers, rule counter unchanged. 51 live Claude connections,
+  all from the tunnel address.
+- The VPN app's own direct traffic (to a test address it routes "direct") is cut by the same
+  kind of rule: HTTP 406 -> refused -> 406.
+- GitHub, npm, PyPI, Cloudflare answer normally with the lock on.
+- Rule removed by hand: back in 6 s; table flushed: back in 1 s; `pfctl -f /etc/pf.conf`: the
+  rule survives, other anchors unchanged.
+- Uninstall: the machine matches the pre-install snapshot line by line.
 
 The daemon's logic is also covered by `tests/sim.sh`: 77 checks on fake `pfctl`, `route`,
-`ifconfig` and `curl`, no root needed. It runs on every push.
+`ifconfig`, `curl` and a fake clock, no root needed. It runs on every push.
 
 ## Development
 
