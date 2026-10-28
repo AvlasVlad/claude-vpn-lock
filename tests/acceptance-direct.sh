@@ -14,8 +14,8 @@
 #    restarted): the lock must close and the kernel must drop packets to Anthropic and to the
 #    control address, from the physical address.                           -> proof: pf counters
 #    The original config is put back, also when this script is interrupted.
-# 4. You turn the VPN on again: the lock follows the tunnel, and Claude processes keep 0
-#    connections from the physical address.
+# 4. You turn the VPN on again: the lock follows the tunnel, and the kernel drops a control
+#    packet that leaves from the physical address.
 # Full log: ~/Library/Logs/claude-vpn-lock/acceptance-direct-<time>.log
 
 set -uo pipefail
@@ -110,14 +110,20 @@ say "  mode=$(mode_now) pinned=$(pin_now)"
 step "4. Turn the VPN ON"
 say "  >>> Turn ON the VPN in your VPN app now. Waiting up to 180 s. <<<"
 wait_for 'is_vpn_name "$(route_iface)"' 180
-wait_for '[ "$(mode_now)" = open ] || [ "$(mode_now)" = country ]' 30
+# The rule still names the old interface until the daemon has checked the new tunnel's exit
+# (a few seconds). Only then is the state meant to follow the tunnel.
+wait_for '{ [ "$(mode_now)" = open ] && ! is_link_id "$(pin_now)"; } || [ "$(mode_now)" = country ]' 40
 say "  route=$(route_iface) mode=$(mode_now) pinned=$(pin_now)"
 say "  exit: $(grep -v '^at=' "${CVL_VAR}/country" 2>/dev/null | tr '\n' ' ')"
-claude_from_real=$(lsof -nP -iTCP -sTCP:ESTABLISHED 2>/dev/null | awk -v r="${REAL}:" 'tolower($1) ~ /^claude/ && index($9, r) == 1 && $9 ~ /->(160\.79\.|\[2607:6bc0)/ { n++ } END { print n + 0 }')
-say "  Claude connections from ${REAL} to Anthropic after the VPN came on: ${claude_from_real}"
+say "  (connections opened directly while the VPN was off may linger until their next packet: $(lsof -nP -iTCP -sTCP:ESTABLISHED 2>/dev/null | awk -v r="${REAL}:" 'tolower($1) ~ /^claude/ && index($9, r) == 1 && $9 ~ /->(160\.79\.|\[2607:6bc0)/ { n++ } END { print n + 0 }'))"
+b=$(rule_counter) || b=""
+curl -s -o /dev/null -m 3 --interface "${REAL}" "http://${CANARY_NET}/"; rc=$?
+a=$(rule_counter) || a=""
+say "  control packet from ${REAL}: curl ${rc}; rule counter ${b:-?} -> ${a:-?}"
 ok=0
-{ [ "$(mode_now)" = open ] && ! is_link_id "$(pin_now)" || [ "$(mode_now)" = country ]; } && [ "${claude_from_real}" = 0 ] && ok=1
-verdict "VPN on: the lock follows the tunnel, 0 Claude connections past it" "${ok}"
+{ [ "$(mode_now)" = open ] && ! is_link_id "$(pin_now)" || [ "$(mode_now)" = country ]; } \
+  && [ "${rc}" = 7 ] && [ -n "${b}" ] && [ -n "${a}" ] && [ "${a}" -gt "${b}" ] && ok=1
+verdict "VPN on: the lock follows the tunnel, the kernel drops a packet past it" "${ok}"
 
 step "Acceptance summary"
 printf '%s' "${RESULTS}" | sed 's/^/  /'

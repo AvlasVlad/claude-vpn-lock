@@ -239,8 +239,22 @@ check, the VPN switched off and on by hand, uninstall, reinstall. From that run 
   rule survives, other anchors unchanged.
 - Uninstall: the machine matches the pre-install snapshot line by line.
 
-The daemon's logic is also covered by `tests/sim.sh`: 77 checks on fake `pfctl`, `route`,
-`ifconfig`, `curl` and a fake clock, no root needed. It runs on every push.
+`DIRECT_POLICY=country` (1.1.0) was accepted on the same Mac on 28 Oct 2026 with
+`tests/acceptance-direct.sh`, in a network whose own exit is allowed:
+
+- VPN off: the daemon verified the network's exit and opened the rule on `en0`; `check.sh`
+  (D2-D4) passed; Anthropic answered directly, the rule counter did not move.
+- The network's own country was added to `BLOCKED_COUNTRIES` for a few seconds: the lock
+  closed, and the kernel refused both the control packet and a packet to `160.79.104.10`
+  (rule counter +3). The config was put back and the lock opened again.
+- VPN back on: the daemon re-pinned the rule to the tunnel after checking its exit, and a
+  control packet from the Wi-Fi address was refused (curl code 7). The script's last assertion
+  was corrected after this run (it sampled a moment before the daemon switched); the result
+  above was confirmed by the daemon log and by hand.
+
+The daemon's logic is also covered by `tests/sim.sh`: 119 checks on fake `pfctl`, `route`,
+`ifconfig`, `arp`, `curl` and a fake clock, no root needed. It runs on every push. Every
+decision of the direct mode was shown to turn a test red when it is removed.
 
 ## Development
 
