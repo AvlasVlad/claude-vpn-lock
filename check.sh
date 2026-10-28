@@ -53,6 +53,9 @@ trap cleanup_test_anchor EXIT
 MODE_NOW=$(cat "${CVL_VAR}/mode" 2>/dev/null)
 PIN_NOW=$(cat "${CVL_VAR}/pinned" 2>/dev/null)
 TUN_IF=${PIN_NOW%% *}
+# DIRECT_POLICY=country with a verified plain network: the pinned interface is the physical one.
+DIRECT_NOW=0
+[ "${MODE_NOW}" = open ] && is_link_id "${PIN_NOW}" && DIRECT_NOW=1
 TUN_ADDR=$(first_addr "${PIN_NOW}")
 REAL=$(direct_addr) || REAL=""
 
@@ -70,13 +73,59 @@ step "P1. Daemon and rule are in place"
 launchctl print "system/${CVL_LABEL}" 2>/dev/null | grep -q 'state = running' && pass "daemon is running (launchd)" || fail "daemon is not running"
 pf_enabled && pass "pf is enabled" || fail "pf is disabled"
 main_has_apple_anchor && pass "main pf ruleset contains the \"com.apple/*\" anchor" || fail "main pf ruleset has no \"com.apple/*\" anchor"
-[ "${MODE_NOW}" = open ] && pass "mode is open, tunnel ${PIN_NOW}" || fail "mode is ${MODE_NOW} (expected open while the VPN is on)"
+if [ "${DIRECT_NOW}" = 1 ]; then pass "mode is open on a direct network (DIRECT_POLICY=country), ${PIN_NOW}"
+elif [ "${MODE_NOW}" = open ]; then pass "mode is open, tunnel ${PIN_NOW}"
+else fail "mode is ${MODE_NOW} (expected open while the VPN is on)"; fi
 case "$(anchor_rule)" in
   *"on ! ${TUN_IF} "*) pass "rule: $(anchor_rule)" ;;
   *) fail "rule is not bound to ${TUN_IF}: $(anchor_rule)" ;;
 esac
 [ "$(route_iface)" = "${TUN_IF}" ] && pass "route to Anthropic goes through ${TUN_IF}" || fail "route to Anthropic goes through $(route_iface), but the rule is bound to ${TUN_IF}"
 info "networks in the table: $(pfctl -a "${CVL_ANCHOR}" -t claude_nets -T show 2>/dev/null | tr -s ' \n' ' ')"
+
+if [ "${DIRECT_NOW}" = 1 ]; then
+step "D2. The rule leaves the verified direct network alone (control address ${CANARY_NET})"
+if [ -z "${REAL}" ]; then
+  fail "could not find the address of the physical interface"
+else
+  b=$(rule_packets)
+  curl -s -o /dev/null -m 3 --interface "${REAL}" "http://${CANARY_NET}/"; rc=$?
+  a=$(rule_packets)
+  info "curl --interface ${REAL} http://${CANARY_NET}/ -> curl code ${rc}; rule counter ${b} -> ${a}"
+  [ "${a}" = "${b}" ] && pass "the rule did not fire for the network it is pinned to" || fail "the rule fired on the pinned network"
+fi
+
+step "D3. The network's own exit country is allowed"
+check_exit "$(first_addr "${PIN_NOW}")"; crc=$?
+case "${crc}" in
+  0) pass "${VERDICT} (blocked: ${BLOCKED_COUNTRIES})" ;;
+  1) fail "${VERDICT} is a blocked country (${BLOCKED_COUNTRIES}); the daemon should close the lock within seconds" ;;
+  *) untested "the network's country could not be obtained now" ;;
+esac
+
+step "D4. Claude reaches Anthropic directly; the rule does not fire"
+if [ "${crc}" != 0 ] || [ -z "${REAL}" ]; then
+  untested "no request to Anthropic: the network's country is not confirmed as allowed (D3) or there is no physical address"
+else
+  b=$(rule_counter) || b=""
+  resp=$(curl -4 -s -m 12 -o /dev/null -w '%{http_code} %{local_ip}' --interface "${REAL}" https://api.anthropic.com/ 2>/dev/null)
+  a=$(rule_counter) || a=""
+  code=${resp%% *}
+  info "https://api.anthropic.com/ from ${REAL} -> HTTP ${code:-none}; rule counter ${b:-?} -> ${a:-?}"
+  if [ -n "${code}" ] && [ "${code}" != 000 ] && [ -n "${b}" ] && [ "${a}" = "${b}" ]; then pass "Anthropic answered (HTTP ${code}) from the verified direct network"
+  elif [ -z "${b}" ] || [ -z "${a}" ]; then untested "counter not obtained"
+  elif [ "${a}" -gt "${b}" ] 2>/dev/null; then fail "the rule dropped packets to Anthropic on the pinned network"
+  else untested "Anthropic did not answer (HTTP ${code:-none}) and the rule dropped nothing: the network, not the lock"; fi
+fi
+info "P2-P11 prove the tunnel mode and do not apply while a direct network is allowed."
+info "To see the lock close on a blocked country, run tests/acceptance-direct.sh (maintainers)."
+
+step "Summary"
+[ "${UNTESTED}" = 0 ] || say "  NOT MEASURED: ${UNTESTED} (neither a failure nor a success; see above)"
+[ "${FAILS}" = 0 ] && say "  NO FAILURES" || say "  FAILED CHECKS: ${FAILS}"
+[ "${FAILS}" = 0 ] && [ "${UNTESTED}" -gt 0 ] && exit 100
+exit "${FAILS}"
+fi
 
 step "P2. A packet outside the tunnel is dropped by the kernel (control address ${CANARY_NET})"
 P2_OK=0

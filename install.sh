@@ -176,6 +176,10 @@ BLOCKED_COUNTRIES="RU BY"
 COUNTRY_INTERVAL=30
 # A new tunnel whose exit country cannot be checked: open (noted in the log) or closed.
 COUNTRY_FAIL=open
+# block   - Claude only through a verified VPN tunnel (default).
+# country - also allowed WITHOUT a VPN while this network's own exit country is not in
+#           BLOCKED_COUNTRIES (checked through the network itself; unknown = closed).
+DIRECT_POLICY=block
 CONF
   chown root:wheel "${CVL_CONF}"
   chmod 644 "${CVL_CONF}"
@@ -207,7 +211,7 @@ step "Verify: a packet past the tunnel is dropped, Claude works through the tunn
 vrc=$?
 case "${vrc}" in
   0) ;;
-  2) say "  WARNING: test packet not sent (no physical interface address) - blocking NOT verified" ;;
+  2) say "  WARNING: the test packet could not prove the blocking (no physical interface address, or a direct network is allowed by DIRECT_POLICY=country) - blocking NOT verified" ;;
   *) rollback "the test packet past the tunnel was not dropped" ;;
 esac
 # One request to Anthropic, never repeated; see claude_tunnel_probe in lib/common.sh. Its

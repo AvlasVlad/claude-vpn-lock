@@ -10,7 +10,7 @@ set -uo pipefail
 export LC_ALL=C
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DAEMON="${HERE}/../lib/claude-vpn-lock-daemon.sh"
+DAEMON="${CVL_SIM_DAEMON:-${HERE}/../lib/claude-vpn-lock-daemon.sh}"   # CVL_SIM_DAEMON: a mutated copy, for disable-probes
 SIM="$(mktemp -d "${TMPDIR:-/tmp}/cvl-sim.XXXXXX")"
 W="${SIM}/world"
 BIN="${SIM}/bin"
@@ -74,7 +74,7 @@ cat >"${BIN}/route" <<'EOF'
 W="${CVL_WORLD}"
 case "$*" in
   *monitor*) [ -f "$W/monitor_dies" ] && exit 0; exec tail -n 0 -f "$W/events" ;;
-  *get*) printf '   route to: x\n  interface: %s\n' "$(cat "$W/route_iface")" ;;
+  *get*) printf '   route to: x\n gateway: %s\n  interface: %s\n' "$(cat "$W/gateway" 2>/dev/null || echo 192.168.1.1)" "$(cat "$W/route_iface")" ;;
 esac
 EOF
 
@@ -108,13 +108,26 @@ if [ -f "$W/curl_delay" ]; then
 fi
 case "$url" in
   *cdn-cgi/trace*)
-    if [ "$iface" = 192.168.1.20 ]; then printf 'ip=%s\nloc=RU\n' "$(cat "$W/home_ip")"; exit 0; fi
+    if [ "$iface" = 192.168.1.20 ]; then
+      [ -f "$W/home_fail" ] && exit 28
+      printf 'ip=%s\nloc=%s\n' "$(cat "$W/home_ip")" "$(cat "$W/home_loc" 2>/dev/null || echo RU)"; exit 0
+    fi
     e=$(cat "$W/exit")
     [ "$e" = fail ] && exit 28
     printf 'fl=1\nip=%s\nts=1\nloc=%s\n' "${e#* }" "${e%% *}"; exit 0 ;;
 esac
 exit 7
 EOF
+
+default_arp() {   # scenarios that replace the fake restore it through reset_world
+  cat >"${BIN}/arp" <<'EOF'
+#!/bin/bash
+W="${CVL_WORLD}"
+printf '? (%s) at %s on en0 ifscope [ethernet]\n' "${@: -1}" "$(cat "$W/gw_mac" 2>/dev/null || echo aa:bb:cc:dd:ee:01)"
+EOF
+  chmod +x "${BIN}/arp"
+}
+default_arp
 
 cat >"${BIN}/dscacheutil" <<'EOF'
 #!/bin/bash
@@ -140,9 +153,10 @@ tunnel() {   # name index generation [addr]
 
 export CVL_WORLD="${W}" CVL_STATE_DIR="${SIM}/state" CVL_LOG="${SIM}/daemon.log" CVL_CONFIG=/nonexistent \
   CVL_HOSTS="${W}/hosts" CVL_PFCTL="${BIN}/pfctl" CVL_ROUTE="${BIN}/route" CVL_IFCONFIG="${BIN}/ifconfig" \
-  CVL_NETSTAT="${BIN}/netstat" CVL_CURL="${BIN}/curl" CVL_DSCACHEUTIL="${BIN}/dscacheutil" CVL_NO_NOTIFY=1
+  CVL_NETSTAT="${BIN}/netstat" CVL_CURL="${BIN}/curl" CVL_DSCACHEUTIL="${BIN}/dscacheutil" CVL_ARP="${BIN}/arp" CVL_NO_NOTIFY=1
 
 reset_world() {
+  default_arp
   rm -rf "${W}" "${SIM}/state" "${SIM}/daemon.log"
   mkdir -p "${W}/ifaces" "${W}/dns" "${SIM}/state"
   : >"${W}/events"
@@ -405,6 +419,144 @@ chmod +x "${SIM}/clock/date"
 reset_world; lib; COUNTRY_WAIT_MAX=1; echo "NL 192.0.2.52" >"${W}/exit"; rm -f "${W}/clock_calls"
 v=$( PATH="${SIM}/clock:${PATH}"; check_exit 198.18.0.1 >/dev/null; printf '%s' "${VERDICT}" )
 check "exit found despite the boundary (${v})" [ "${v}" = "exit NL 192.0.2.52" ]
+
+printf '== 29. DIRECT_POLICY=country, no VPN, network exit in an allowed country -> open on the plain interface\n'
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+cmd_once >/dev/null
+check "mode open" [ "$(mode)" = open ]
+check "rule is pinned to en0" grep -q 'block return out quick on ! en0 to <claude_nets> label "cvl-offtunnel"' "${W}/anchor"
+check "pinned identity names the gateway and its MAC" grep -q '^en0 14 - 192.168.1.20,gw=192.168.1.1,mac=aa:bb:cc:dd:ee:01$' "${SIM}/state/pinned"
+check "the country was asked through the physical address" grep -q 'iface=192.168.1.20 url=https://1.1.1.1/cdn-cgi/trace' "${W}/curl_calls"
+check "logged as a direct network" logged 'direct network en0'
+
+printf '== 30. same, but the network exit is in a blocked country -> closed (country)\n'
+reset_world; lib; DIRECT_POLICY=country; echo RU >"${W}/home_loc"
+cmd_once >/dev/null
+check "mode country" [ "$(mode)" = country ]
+check "rule blocks everything" grep -q 'cvl-closed' "${W}/anchor"
+check "log says this is the network's own exit" logged "no VPN: this network's own exit"
+
+printf '== 31. the network exit cannot be told -> closed, never opened by COUNTRY_FAIL=open; retried every COUNTRY_RETRY s\n'
+reset_world; lib; DIRECT_POLICY=country; COUNTRY_FAIL=open; touch "${W}/home_fail"
+cmd_once >/dev/null
+check "mode closed" [ "$(mode)" = closed ]
+check "counted" [ "$(counter link_unknown_closed)" = 1 ]
+c1=$(grep -c 'iface=192.168.1.20' "${W}/curl_calls")
+evaluate tick; evaluate event
+c2=$(grep -c 'iface=192.168.1.20' "${W}/curl_calls")
+check "no new lookup within COUNTRY_RETRY (${c1} -> ${c2})" [ "${c1}" = "${c2}" ]
+LAST_COUNTRY=0; rm -f "${W}/home_fail"; echo VN >"${W}/home_loc"; evaluate tick
+check "after the retry time the country is known and the lock opens" [ "$(mode)" = open ]
+
+printf '== 32. default policy: no VPN stays closed and the network is never asked\n'
+reset_world; lib; echo VN >"${W}/home_loc"
+cmd_once >/dev/null
+check "mode closed" [ "$(mode)" = closed ]
+check_not "no lookup through the physical interface" grep -qs 'iface=192.168.1.20' "${W}/curl_calls"
+
+printf '== 33. direct open -> a VPN is switched on: blocked until its exit is known; then follows the VPN\n'
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+cmd_once >/dev/null
+tunnel utun70 90 400; echo utun70 >"${W}/route_iface"; echo "RU 192.0.2.65" >"${W}/exit"
+check "before the check the rule still names en0, so the new tunnel is already blocked" grep -q 'on ! en0 to' "${W}/anchor"
+evaluate event
+check "VPN exit RU -> country" [ "$(mode)" = country ]
+echo "NL 192.0.2.52" >"${W}/exit"; LAST_COUNTRY=0; evaluate tick
+check "VPN exit NL -> open on the tunnel" grep -q 'on ! utun70 to' "${W}/anchor"
+rm -f "${W}/ifaces/utun70"; echo en0 >"${W}/route_iface"; evaluate event
+check "VPN off, network exit VN -> open on en0 again" grep -q 'on ! en0 to' "${W}/anchor"
+
+printf '== 34. the network changes under the same interface name -> closed at once, then checked\n'
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+cmd_once >/dev/null
+evaluate tick
+check "an unchanged network does not reload anything" [ "$(counter state_open)" = 1 ]
+echo 10.0.0.1 >"${W}/gateway"; echo "11:22:33:44:55:66" >"${W}/gw_mac"; echo RU >"${W}/home_loc"
+evaluate event
+check "closed first, with the reason" logged 'STATE closed :: event: network changed'
+check "then the verdict for the new network: country" [ "$(mode)" = country ]
+l1=$(grep -n 'network changed' "${SIM}/daemon.log" | head -1 | cut -d: -f1); l2=$(grep -n 'STATE country' "${SIM}/daemon.log" | head -1 | cut -d: -f1)
+check "the closing line comes before the verdict line (${l1} < ${l2})" [ "${l1}" -lt "${l2}" ]
+echo 192.168.1.1 >"${W}/gateway"; echo VN >"${W}/home_loc"; LAST_COUNTRY=0; evaluate tick
+evaluate tick
+check "back to the first network, allowed again" [ "$(mode)" = open ]
+echo "99:88:77:66:55:44" >"${W}/gw_mac"; n0=$(grep -c 'network changed' "${SIM}/daemon.log"); evaluate event
+check "only the gateway MAC differs (same range, same gateway address): still a new network" \
+  [ "$(grep -c 'network changed' "${SIM}/daemon.log")" = $((n0 + 1)) ]
+
+printf '== 35. only plain interfaces count as a direct network\n'
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+printf 'bridge0: flags=8863<UP> mtu 1500 index 20\n\tinet 192.168.2.5 netmask 0xffffff00\n' >"${W}/ifaces/bridge0"; echo bridge0 >"${W}/route_iface"
+cmd_once >/dev/null
+check "bridge0 -> closed" [ "$(mode)" = closed ]
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+tunnel utun71 91 401 198.18.0.1 novpn; echo utun71 >"${W}/route_iface"
+cmd_once >/dev/null
+check "a utun that is not a VPN -> closed" [ "$(mode)" = closed ]
+check_not "neither was asked about its country" grep -qs 'iface=' "${W}/curl_calls"
+
+printf '== 36. daemon restart: the direct state is restored only for the same network\n'
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+cmd_once >/dev/null
+lib; DIRECT_POLICY=country; restore_or_close
+check "same network -> the open rule is kept" logged 'RESTORE kept the open rule for en0'
+echo 10.9.9.1 >"${W}/gateway"
+lib; DIRECT_POLICY=country; restore_or_close
+check "another gateway -> closed until verified" [ "$(mode)" = closed ]
+
+printf '== 37. verify on a direct network does not claim a proof it cannot make\n'
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+cmd_once >/dev/null
+vout=$(cmd_verify); vrc=$?
+check "verify says NOT TESTED (exit 2) and names the reason" bash -c '[ "$1" = 2 ] && printf "%s" "$2" | grep -q "NOT TESTED direct network"' _ "${vrc}" "${vout}"
+st=$(cmd_status)
+check "status shows the policy and the link" bash -c 'printf "%s" "$1" | grep -q "^direct_policy: country" && printf "%s" "$1" | grep -q "^link_now     : en0 14 - 192.168.1.20"' _ "${st}"
+
+printf '== 38. an expired ARP entry for the gateway is not a change of network\n'
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+cmd_once >/dev/null
+cat >"${BIN}/arp" <<'EOF'
+#!/bin/bash
+printf '? (%s) -- no entry\n' "${@: -1}"
+EOF
+n0=$(counter state_open); evaluate tick
+check "no entry -> same identity, nothing reloaded, still open" bash -c '[ "$1" = open ] && [ "$2" = "$3" ]' _ "$(mode)" "$(counter state_open)" "${n0}"
+echo 10.0.0.1 >"${W}/gateway"; evaluate event
+check "another gateway address with no ARP entry is still a new network" logged 'STATE closed :: event: network changed'
+
+printf '== 39. the network exit country changes behind an unchanged address, gateway and MAC (phone SIM swap)\n'
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+cmd_once >/dev/null
+echo RU >"${W}/home_loc"
+LAST_COUNTRY=$(( $(date +%s) - 5 )); evaluate tick
+check "within DIRECT_INTERVAL nothing is asked yet" [ "$(mode)" = open ]
+LAST_COUNTRY=$(( $(date +%s) - 11 )); evaluate tick
+check "after DIRECT_INTERVAL (10 s, not COUNTRY_INTERVAL 30 s) the lock closes" [ "$(mode)" = country ]
+
+printf '== 40. an open direct network whose country can no longer be told is closed, then reopened\n'
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+cmd_once >/dev/null
+touch "${W}/home_fail"
+LAST_COUNTRY=$(( $(date +%s) - 11 )); evaluate tick
+check "closed at the first periodic check without an answer" [ "$(mode)" = closed ]
+check "counted" [ "$(counter link_unknown_closed)" = 1 ]
+c1=$(grep -c 'iface=192.168.1.20' "${W}/curl_calls"); evaluate tick; c2=$(grep -c 'iface=192.168.1.20' "${W}/curl_calls")
+check "not asked again within COUNTRY_RETRY (${c1} -> ${c2})" [ "${c1}" = "${c2}" ]
+rm -f "${W}/home_fail"; LAST_COUNTRY=0; evaluate tick
+check "answers are back -> open again" [ "$(mode)" = open ]
+
+printf '== 41. ARP entry "(incomplete)": ignored on a tick, a difference on a routing event\n'
+reset_world; lib; DIRECT_POLICY=country; echo VN >"${W}/home_loc"
+cmd_once >/dev/null
+cat >"${BIN}/arp" <<'EOF'
+#!/bin/bash
+printf '? (%s) at (incomplete) on en0 ifscope [ethernet]\n' "${@: -1}"
+EOF
+n0=$(counter state_open); evaluate tick
+check "tick: same network, nothing reloaded" bash -c '[ "$1" = "$2" ] && [ "$3" = open ]' _ "$(counter state_open)" "${n0}" "$(mode)"
+evaluate event
+check "routing event: the unresolved gateway MAC is a difference, closed first" logged 'STATE closed :: event: network changed'
+check "and the verified network opens again" [ "$(mode)" = open ]
 
 printf '\nsimulation: %s passed, %s failed\n' "${PASS}" "${FAIL}"
 [ -n "${CVL_SIM_KEEP:-}" ] && printf 'world kept in %s\n' "${SIM}" || rm -rf "${SIM}"

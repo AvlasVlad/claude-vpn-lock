@@ -20,6 +20,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 [ -x "${CVL_DAEMON}" ] || die "the lock is not installed"
 CVL_LIB=1 CVL_NO_NOTIFY=1 . "${CVL_DAEMON}"
 
+[ "${DIRECT_POLICY}" = country ] && die "DIRECT_POLICY=country: with the VPN off the lock opens in an allowed country by design, so this test does not apply; use tests/acceptance-direct.sh"
 REAL=$(direct_addr) || REAL=""
 [ -n "${REAL}" ] || die "could not find the address of the physical interface"
 is_vpn_name "$(route_iface)" || die "the VPN is off right now; turn it on and run this again"

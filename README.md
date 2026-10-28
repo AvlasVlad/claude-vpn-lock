@@ -136,6 +136,34 @@ sudo bash uninstall.sh             # removes everything and compares the machine
 - `COUNTRY_INTERVAL=30`: how often the exit country is re-checked, seconds.
 - `COUNTRY_FAIL=open`: a new tunnel whose exit country cannot be checked: `open` (noted
   in the log) or `closed`.
+- `DIRECT_POLICY=block` (default) or `country`: see the next section.
+- `DIRECT_INTERVAL=10`: with `country`, how often the exit country of a direct network is
+  re-asked, seconds (open or blocked).
+
+### Optional: no VPN needed in a country where Claude is allowed
+
+By default the lock demands a VPN at all times. If you live or travel in a country that is
+**not** in `BLOCKED_COUNTRIES`, set `DIRECT_POLICY=country`:
+
+- **No VPN, plain network (Wi-Fi, Ethernet, tethering: `en0`, `en1`...)**: the daemon asks,
+  through that very network, which country its own exit is in. Allowed country: Claude works
+  directly, with no VPN latency. The rule is then pinned to that interface
+  (`block ... on ! en0 ...`), so a VPN switched on later is blocked until its exit is checked.
+- **Blocked country, or the answer cannot be obtained: closed.** An unknown country is never
+  allowed on a direct network, not even one that was open a moment ago (`COUNTRY_FAIL` does
+  not apply to it).
+- **A VPN is on:** unchanged. A tunnel whose exit is in `BLOCKED_COUNTRIES` (for example a
+  Russian VPN you switch on to test something) keeps Claude blocked.
+- **The network changes** (other Wi-Fi, other gateway, even in the same address range): the
+  lock closes and checks again before opening. On a routing event this happens at once; if
+  nothing announces the change, within one 5 s tick.
+
+This mode has a reaction window the tunnel mode does not: the interface name stays `en0` when
+you move to another network, so for the first moments after a change the old rule is still in
+place. If the address, the gateway and its MAC all stay the same while the exit country
+changes (a phone hotspot after a SIM swap, a travel router), no event announces it and the
+window is up to `DIRECT_INTERVAL` seconds (10 by default). Keep `block` if that is not
+acceptable. `check.sh` runs different checks (D2-D4) while a direct network is allowed.
 
 ## Logs and status
 
@@ -178,6 +206,10 @@ tail -f /var/log/claude-vpn-lock.log
 - VPN apps in **proxy mode** (no TUN interface): the installer will not install. If you switch
   the VPN app to proxy mode later, the lock stays "closed": programs that use the proxy keep
   working, programs that ignore it are blocked (by design; not tested).
+- `DIRECT_POLICY=country`: the country comes from the exit IP address as Cloudflare sees it
+  (IPv4 only); a wrong or outdated geo-IP entry is a wrong verdict. Only `en*` interfaces
+  count as a direct network; bridges and cellular links stay closed. The reaction window
+  after a network change is described in Settings.
 - pf stays enabled while the lock is installed (it is off by default on macOS).
 - `check.sh --heal-tests` (used by `tests/acceptance.sh`) removes the rule for a few seconds to
   prove the daemon restores it. During those seconds Anthropic is not blocked outside the

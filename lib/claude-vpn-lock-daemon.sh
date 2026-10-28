@@ -21,6 +21,16 @@
 #   - holds its own pf enable reference and re-loads the anchor if something flushed it;
 #   - learns addresses of Anthropic hosts that live outside Anthropic's own network.
 #
+# DIRECT_POLICY=country (off by default) adds one more verdict for a machine that is NOT behind
+# a VPN: if the route to Anthropic leaves through a plain interface (en0, en1, ...), the daemon
+# asks through that interface which country the network's own exit is in. Allowed country: the
+# same rule is pinned to that interface (`on ! en0`), so a VPN switched on later is blocked until
+# its exit is checked, and any change of the network (address, gateway, gateway MAC) closes the
+# lock at once and re-checks. Blocked country, or an answer that cannot be obtained: closed,
+# also for an already open network (a direct network has no "COUNTRY_FAIL=open").
+# The exit country of a direct network is re-asked every DIRECT_INTERVAL seconds: that bounds the
+# window for a change that no routing event announces (phone SIM swap, travel router).
+#
 # Commands: run | once | status | verify | version
 # Sourced with CVL_LIB=1 it only defines functions (used by check.sh and the tests).
 # CVL_* environment variables replace paths and binaries for the unprivileged simulation.
@@ -28,7 +38,7 @@
 set -uo pipefail
 export LC_ALL=C
 
-VERSION=1.0.0
+VERSION=1.1.0
 
 # Everything lives under /opt/claude-vpn-lock, owned by root. Not /usr/local: on an Intel Mac
 # with Homebrew /usr/local/* belongs to the user, who could then swap what root runs.
@@ -43,6 +53,7 @@ IFCONFIG="${CVL_IFCONFIG:-/sbin/ifconfig}"
 NETSTAT="${CVL_NETSTAT:-/usr/sbin/netstat}"
 CURL="${CVL_CURL:-/usr/bin/curl}"
 DSCACHEUTIL="${CVL_DSCACHEUTIL:-/usr/bin/dscacheutil}"
+ARP="${CVL_ARP:-/usr/sbin/arp}"
 
 # Defaults; the config file may override any of them.
 PINNED_NETS="160.79.104.0/21 2607:6bc0::/32"   # Anthropic, PBC (whois AP-2440)
@@ -57,6 +68,8 @@ LEARN_DOMAINS="api.anthropic.com claude.ai platform.claude.com console.anthropic
 LEARN_INTERVAL=1800
 LEARN_MAX_AGE=2592000
 BLOCKED_COUNTRIES="RU BY"
+DIRECT_POLICY=block    # block: Claude only through a verified VPN tunnel; country: see above
+DIRECT_INTERVAL=10     # seconds between exit checks of a direct network (open or blocked)
 COUNTRY_URLS="https://1.1.1.1/cdn-cgi/trace https://www.cloudflare.com/cdn-cgi/trace https://ipinfo.io/json"
 COUNTRY_INTERVAL=30
 COUNTRY_RETRY=5
@@ -90,6 +103,8 @@ if [ -r "${CONFIG}" ]; then
   fi
 fi
 
+case "${DIRECT_POLICY}" in country) ;; *) DIRECT_POLICY=block ;; esac
+
 MODE_FILE="${STATE_DIR}/mode"
 PIN_FILE="${STATE_DIR}/pinned"
 COUNTRY_FILE="${STATE_DIR}/country"
@@ -104,6 +119,7 @@ PINNED_ID=""       # "<iface> <index> <generation> <addrs>" of the verified tunn
 PINNED_IF=""
 LAST_COUNTRY=0
 UNKNOWN_STREAK=0
+LINK_UNKNOWN_ID=""   # a direct network whose country could not be told (retried every COUNTRY_RETRY s)
 VERDICT=""
 
 # ------------------------------------------------------------------ plumbing
@@ -228,6 +244,46 @@ direct_addr() {
   [ -n "${ifc}" ] || return 1
   "${IFCONFIG}" "${ifc}" 2>/dev/null | awk '/[ \t]inet / { print $2; exit }'
 }
+
+# A plain interface (Wi-Fi, Ethernet, USB/phone tethering: en0, en1, ...) as opposed to a VPN.
+is_link_id() { case "${1%% *}" in en[0-9]*) return 0 ;; esac; return 1; }
+
+# DIRECT_POLICY=country only: "<iface> <index> <generation> <ipv4>,gw=<gateway>,mac=<gateway mac>"
+# of the plain interface that carries the route to Anthropic right now. Status 1 when the policy
+# is off, the route is not on an en* interface, or the interface has no IPv4 address to ask from.
+# The gateway and its MAC are in the identity so that moving to another network under the same
+# interface name (same address range included) is a different identity.
+link_identity() {
+  local ifc gw mac
+  [ "${DIRECT_POLICY}" = country ] || return 1
+  ifc=$(route_iface)
+  is_link_id "${ifc}" || return 1
+  gw=$("${ROUTE}" -n get "${ROUTE_PROBE}" 2>/dev/null | awk '/gateway:/ { print $2; exit }')
+  mac=""
+  [ -n "${gw}" ] && mac=$("${ARP}" -n "${gw}" 2>/dev/null | awk '
+    { for (i = 1; i < NF; i++) if ($i == "at") {
+        if ($(i + 1) ~ /^[0-9a-fA-F]+(:[0-9a-fA-F]+)+$/) print $(i + 1)   # not "(incomplete)"
+        exit } }')
+  # An idle ARP entry expires; a missing entry is not a change of network. On a periodic tick,
+  # while the gateway address is the pinned one, its pinned MAC stays (the entry is back after
+  # the next request). On a routing event the missing MAC is a difference: the network may be
+  # a new one that has not answered ARP yet.
+  if [ -z "${mac}" ] && [ -n "${gw}" ] && [ "${EVAL_TRIGGER:-}" = tick ]; then
+    case "${PINNED_ID}" in *",gw=${gw},mac="*) mac=${PINNED_ID##*,mac=} ;; esac
+  fi
+  "${IFCONFIG}" -v "${ifc}" 2>/dev/null | awk -v ifc="${ifc}" -v gw="${gw:--}" -v mac="${mac:--}" '
+    NR == 1 { for (i = 1; i <= NF; i++) if ($i == "index") idx = $(i + 1) }
+    /generation id:/ { gen = $NF }
+    /^[ \t]+inet / && v4 == "" { v4 = $2 }
+    END {
+      if (v4 == "") exit 1
+      print ifc, (idx == "" ? "-" : idx), (gen == "" ? "-" : gen), v4 ",gw=" gw ",mac=" mac
+    }'
+}
+
+# The path Anthropic traffic would take now: a verified-tunnel candidate first, else (policy
+# country) a plain link. Status 1 when neither exists.
+current_identity() { tunnel_identity || link_identity; }
 
 # ------------------------------------------------------------------ pf
 
@@ -492,6 +548,7 @@ verify_and_apply() {   # $1 identity  $2 why
   check_exit "${src}"
   rc=$?
   LAST_COUNTRY=$(date +%s)
+  [ "${rc}" -le 1 ] && LINK_UNKNOWN_ID=""
   case "${rc}" in
     0)
       UNKNOWN_STREAK=0
@@ -502,14 +559,30 @@ verify_and_apply() {   # $1 identity  $2 why
     1)
       UNKNOWN_STREAK=0
       if [ "${MODE}" != country ] || [ "${PINNED_ID}" != "$1" ]; then
-        set_country "$1" "$2; ${VERDICT}$(explain_blocked_exit "${VERDICT##* }")"
-        notify country "Claude blocked: VPN exit is ${VERDICT#exit }"
+        if is_link_id "$1"; then
+          set_country "$1" "$2; ${VERDICT} (no VPN: this network's own exit)"
+          notify country "Claude blocked: this network's exit is ${VERDICT#exit }, turn on a VPN"
+        else
+          set_country "$1" "$2; ${VERDICT}$(explain_blocked_exit "${VERDICT##* }")"
+          notify country "Claude blocked: VPN exit is ${VERDICT#exit }"
+        fi
       fi
       ;;
     *)
       counter_bump country_unknown
       UNKNOWN_STREAK=$((UNKNOWN_STREAK + 1))
-      if [ "${PINNED_ID}" != "$1" ]; then
+      if is_link_id "$1"; then
+        # A direct network whose country cannot be told is never allowed: COUNTRY_FAIL does not apply.
+        LINK_UNKNOWN_ID="$1"
+        if [ "${PINNED_ID}" != "$1" ] || [ "${MODE}" = open ]; then
+          counter_bump link_unknown_closed
+          if [ "${MODE}" != closed ] || [ -n "${PINNED_ID}" ]; then
+            set_closed "$2; ${VERDICT}: a direct network is closed until its country is known"
+          fi
+        elif [ $((UNKNOWN_STREAK % 20)) -eq 1 ]; then
+          log "WARN ${VERDICT} (streak ${UNKNOWN_STREAK}); state ${MODE} kept"
+        fi
+      elif [ "${PINNED_ID}" != "$1" ]; then
         # A tunnel with no verdict yet. Unknown is never a reason to leave a known state.
         if [ "${COUNTRY_FAIL}" = open ]; then
           counter_bump country_unknown_opened
@@ -526,8 +599,9 @@ verify_and_apply() {   # $1 identity  $2 why
 }
 
 evaluate() {   # $1 = trigger
-  local id now
-  id=$(tunnel_identity) || id=""
+  local id now every
+  EVAL_TRIGGER="$1"
+  id=$(current_identity) || id=""
   now=$(date +%s)
   if [ -z "${id}" ]; then
     if [ "${MODE}" != closed ] || [ -n "${PINNED_ID}" ]; then
@@ -538,19 +612,30 @@ evaluate() {   # $1 = trigger
   if [ "${id}" != "${PINNED_ID}" ]; then
     # A tunnel we have not verified. Under a new name the pinned rule already blocks it;
     # under the pinned name it would pass, so close before checking.
-    if [ "${MODE}" = open ] && [ "${id%% *}" = "${PINNED_IF}" ] \
-       && [ "$(instance_of "${id}")" != "$(instance_of "${PINNED_ID}")" ]; then
-      set_closed "$1: tunnel ${PINNED_IF} was re-created (${PINNED_ID} -> ${id})"
+    if [ "${MODE}" = open ] && [ "${id%% *}" = "${PINNED_IF}" ]; then
+      if is_link_id "${id}"; then
+        set_closed "$1: network changed (${PINNED_ID} -> ${id})"
+      elif [ "$(instance_of "${id}")" != "$(instance_of "${PINNED_ID}")" ]; then
+        set_closed "$1: tunnel ${PINNED_IF} was re-created (${PINNED_ID} -> ${id})"
+      fi
     fi
-    verify_and_apply "${id}" "$1: tunnel ${id}"
+    # A direct network that gave no answer is asked again after COUNTRY_RETRY s, not on every tick.
+    if [ "${id}" = "${LINK_UNKNOWN_ID}" ] && [ $((now - LAST_COUNTRY)) -lt "${COUNTRY_RETRY}" ]; then
+      return 0
+    fi
+    verify_and_apply "${id}" "$1: $(is_link_id "${id}" && printf 'direct network' || printf tunnel) ${id}"
     return 0
   fi
   case "${MODE}" in
     open)
-      [ $((now - LAST_COUNTRY)) -ge "${COUNTRY_INTERVAL}" ] && verify_and_apply "${id}" "$1: periodic check"
+      every=${COUNTRY_INTERVAL}
+      is_link_id "${id}" && every=${DIRECT_INTERVAL}
+      [ $((now - LAST_COUNTRY)) -ge "${every}" ] && verify_and_apply "${id}" "$1: periodic check"
       ;;
     *)
-      [ $((now - LAST_COUNTRY)) -ge "${COUNTRY_RETRY}" ] && verify_and_apply "${id}" "$1: re-check"
+      every=${COUNTRY_RETRY}
+      is_link_id "${id}" && every=${DIRECT_INTERVAL}
+      [ $((now - LAST_COUNTRY)) -ge "${every}" ] && verify_and_apply "${id}" "$1: re-check"
       ;;
   esac
   return 0
@@ -590,7 +675,7 @@ restore_or_close() {
   local saved_mode saved_pin cur
   saved_mode=$(cat "${MODE_FILE}" 2>/dev/null)
   saved_pin=$(cat "${PIN_FILE}" 2>/dev/null)
-  cur=$(tunnel_identity) || cur=""
+  cur=$(current_identity) || cur=""
   if [ "${saved_mode}" = open ] && [ -n "${saved_pin}" ] && [ "${saved_pin}" = "${cur}" ]; then
     MODE=open
     PINNED_ID="${saved_pin}"
@@ -726,7 +811,9 @@ cmd_status() {
   printf 'mode         : %s\n' "$(cat "${MODE_FILE}" 2>/dev/null || printf unknown)"
   printf 'pinned       : %s\n' "$(cat "${PIN_FILE}" 2>/dev/null)"
   printf 'route_iface  : %s (route to %s)\n' "$(route_iface)" "${ROUTE_PROBE}"
+  printf 'direct_policy: %s\n' "${DIRECT_POLICY}"
   printf 'tunnel_now   : %s\n' "$(tunnel_identity || printf none)"
+  [ "${DIRECT_POLICY}" = country ] && printf 'link_now     : %s\n' "$(link_identity || printf none)"
   printf 'exit_check   : %s(%s)\n' "$(grep -v '^at=' "${COUNTRY_FILE}" 2>/dev/null | tr '\n' ' ')" "${age}"
   printf 'pf_enabled   : %s\n' "$(pf_enabled && printf yes || printf no)"
   printf 'pf_token     : %s\n' "$(cat "${TOKEN_FILE}" 2>/dev/null)"
@@ -740,13 +827,25 @@ cmd_status() {
 
 # Proves the loaded rule with the canary address, never with Anthropic itself.
 cmd_verify() {
-  local fails=0 untested=0 addr before after rc
+  local fails=0 untested=0 addr before after rc pin
   printf 'rule: %s\n' "$(anchor_rule)"
   if ! main_has_apple_anchor; then
     printf 'FAIL main ruleset has no anchor "com.apple/*"\n'
     fails=$((fails + 1))
   fi
   pf_enabled || { printf 'FAIL pf is disabled\n'; fails=$((fails + 1)); }
+  pin=$(cat "${PIN_FILE}" 2>/dev/null)
+  if [ "$(cat "${MODE_FILE}" 2>/dev/null)" = open ] && is_link_id "${pin}"; then
+    # The pinned interface is the physical one: the canary would leave through it, as allowed.
+    case "$(anchor_rule)" in
+      *"on ! ${pin%% *} "*cvl-offtunnel*) printf 'OK the rule is bound to the verified direct network %s\n' "${pin%% *}" ;;
+      *) printf 'FAIL the rule is not bound to %s\n' "${pin%% *}"; fails=$((fails + 1)) ;;
+    esac
+    printf 'NOT TESTED direct network: the allowed interface is the physical one, so the canary is not dropped here by design\n'
+    [ "${fails}" -eq 0 ] && { printf 'VERIFY NOT TESTED\n'; return 2; }
+    printf 'VERIFY FAILED (%s)\n' "${fails}"
+    return 1
+  fi
   addr=$(direct_addr) || addr=""
   if [ -z "${addr}" ]; then
     printf 'NOT TESTED no physical interface address: the canary was not sent\n'
